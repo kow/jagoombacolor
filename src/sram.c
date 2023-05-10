@@ -189,14 +189,21 @@ static void flash_bytecopy_raw(u8 *dst, u8 *src, int count)
 
 static void flash_bytecopy(u8 *dst, u8 *src, int count)
 {
-    static EWRAM_BSS sector_buf[0x1000];
-    int prefix_count = 0xfff & (int) dst;
-    int suffix_count = 0x1000 - prefix_count;
+    static EWRAM_BSS prefix_buf[0x1000];
+    static EWRAM_BSS suffix_buf[0x1000];
+    int dst_int = (int) dst;
+    int prefix_count = 0xfff & dst_int;
+    int suffix_count = 0x1000 - (0xfff & (dst_int + count));
+    if (suffix_count == 0x1000)
+        suffix_count = 0;
     // Back up partial sectors
     if (prefix_count)
     {
-        bytecopy(sector_buf, dst - prefix_count, prefix_count);
-        bytecopy(sector_buf + prefix_count, dst + count, suffix_count);
+        bytecopy(prefix_buf, dst - prefix_count, prefix_count);
+    }
+    if (suffix_count)
+    {
+        bytecopy(suffix_buf, dst + count, suffix_count);
     }
     // Erase all sectors in use
     for (u8 *it = dst - prefix_count; it < dst + count; it += 0x1000)
@@ -207,8 +214,11 @@ static void flash_bytecopy(u8 *dst, u8 *src, int count)
     // Restore partial sectors
     if (prefix_count)
     {
-        flash_bytecopy_raw(dst - prefix_count, sector_buf, prefix_count);
-        flash_bytecopy_raw(dst + count, sector_buf + prefix_count, suffix_count);
+        flash_bytecopy_raw(dst - prefix_count, prefix_buf, prefix_count);
+    }
+    if (suffix_count)
+    {
+        flash_bytecopy_raw(dst + count, suffix_buf, suffix_count);
     }
     // Write actual data 
     flash_bytecopy_raw(dst, src, count);
