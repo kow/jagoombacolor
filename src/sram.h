@@ -29,6 +29,13 @@ typedef struct {		//(modified stateheader)
 	char reserved4[32];  //="CFG"
 } configdata;
 
+typedef enum {
+    NONE,
+    SRAM32K,
+    SRAM64K,
+    FLASH64K
+} cartsavetype;
+
 void bytecopy(u8 *dst,u8 *src,int count);
 void flush_end_sram(void);
 void flush_xgb_sram(void);
