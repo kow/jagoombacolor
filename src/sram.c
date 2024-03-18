@@ -32,9 +32,8 @@ int get_saved_sram(void)
 	//#define GBA_SRAM_SIZE 0x10000
 #endif
 
+EWRAM_DATA cartsavetype savetype = SRAM64K;
 EWRAM_DATA u32 save_start = SAVE_START;
-
-
 
 #define STATEID 0x57a731d8
 #define STATEID2 0x57a731d9
@@ -149,25 +148,139 @@ void errmsg(char *s) {
 	drawtext(32+9,"                     ",0);
 }*/
 
-void flush_end_sram()
+#define FLASH_MAGIC_0 ((vu8*) (0x0E005555))
+#define FLASH_MAGIC_1 ((vu8*) (0x0E002AAA))
+
+static void flash_erase_sector(u8 *tgt)
 {
-	u8* sram=MEM_SRAM;
-	int i;
-	int save_end = save_start + 0x2000;
-	for (i=save_start;i<save_end;i++)
-	{
-		sram[i]=0;
-	}
+    *FLASH_MAGIC_0 = 0xAA;
+    *FLASH_MAGIC_1 = 0x55;
+    *FLASH_MAGIC_0 = 0x80;
+    *FLASH_MAGIC_0 = 0xAA;
+    *FLASH_MAGIC_1 = 0x55;
+    *(vu8*) tgt = 0x30;
+    while (*(vu8*) tgt != 0xFF)
+        ;
+    *FLASH_MAGIC_0 = 0xAA;
+    *FLASH_MAGIC_1 = 0x55;
+    *FLASH_MAGIC_0 = 0xF0;
+}
+static void flash_program_byte(u8 *tgt, u8 data)
+{
+    *FLASH_MAGIC_0 = 0xAA;
+    *FLASH_MAGIC_1 = 0x55;
+    *FLASH_MAGIC_0 = 0xA0;
+    *(vu8*) tgt = data;
+    while (*(vu8*) tgt != data)
+        ;
+    *FLASH_MAGIC_0 = 0xAA;
+    *FLASH_MAGIC_1 = 0x55;
+    *FLASH_MAGIC_0 = 0xF0;
 }
 
 
-void probe_sram_size()
+
+// Program only, requires pre-erased sectors or careful use
+static void flash_bytecopy_raw(u8 *dst, u8 *src, int count)
+{  
+    for (int i = 0; i < count; ++i)
+        flash_program_byte(&dst[i], src[i]);
+}
+
+static void flash_bytecopy(u8 *dst, u8 *src, int count)
+{
+    static EWRAM_BSS prefix_buf[0x1000];
+    static EWRAM_BSS suffix_buf[0x1000];
+    int dst_int = (int) dst;
+    int prefix_count = 0xfff & dst_int;
+    int suffix_count = 0x1000 - (0xfff & (dst_int + count));
+    if (suffix_count == 0x1000)
+        suffix_count = 0;
+    // Back up partial sectors
+    if (prefix_count)
+    {
+        bytecopy(prefix_buf, dst - prefix_count, prefix_count);
+    }
+    if (suffix_count)
+    {
+        bytecopy(suffix_buf, dst + count, suffix_count);
+    }
+    // Erase all sectors in use
+    for (u8 *it = dst - prefix_count; it < dst + count; it += 0x1000)
+    {
+        flash_erase_sector(it);
+    }
+    
+    // Restore partial sectors
+    if (prefix_count)
+    {
+        flash_bytecopy_raw(dst - prefix_count, prefix_buf, prefix_count);
+    }
+    if (suffix_count)
+    {
+        flash_bytecopy_raw(dst + count, suffix_buf, suffix_count);
+    }
+    // Write actual data 
+    flash_bytecopy_raw(dst, src, count);
+}
+
+// Note: no matter the contents of flash, it does not need to be erased before being zeroed, because a bit can always be set to 0
+static void flash_zerofill(u8 *tgt, int count)
+{
+    for (u8 *it = tgt; it < tgt + count; ++it)
+        flash_program_byte(it, 0);
+}
+
+void flush_end_sram()
+{
+	u8* sram=MEM_SRAM;
+	int i, j;
+	int save_end = save_start + 0x2000;
+    if (savetype == FLASH64K)
+    {
+        flash_zerofill(&sram[save_start], 0x2000);
+    }
+    else 
+    {
+        for (i=save_start;i<save_end;i++)
+        {
+            sram[i]=0;
+        }
+    }
+}
+
+
+void probe_savetype()
 {
 	vu8* sram=MEM_SRAM;
 	vu8* sram2=MEM_SRAM + 0x8000;
 	u32 val1;
 	u32 val2;
 	u32 newval2;
+    
+    u8 buftop[2] = { sram[0], sram[1] };
+    u8 bufmagic[2] = { *FLASH_MAGIC_0, *FLASH_MAGIC_1 };
+    u8 foundflash = 0;
+    
+    *FLASH_MAGIC_0 = 0xAA;
+    *FLASH_MAGIC_1 = 0x55;
+    *FLASH_MAGIC_0 = 0x90;
+    if (buftop[0] != sram[0] || buftop[1] != sram[1])
+    {
+        save_start = SAVE_START_64K;
+        savetype = FLASH64K;
+        foundflash = 1;
+    }
+    
+    *FLASH_MAGIC_0 = 0xAA;
+    *FLASH_MAGIC_1 = 0x55;
+    *FLASH_MAGIC_0 = 0xF0;
+    
+    *FLASH_MAGIC_0 = bufmagic[0];
+    *FLASH_MAGIC_1 = bufmagic[1];
+    
+    if (foundflash)
+        return;
 	
 	val1 = sram[0]+(sram[1]<<8)+(sram[2]<<16)+(sram[3]<<24);
 	val2 = sram2[0]+(sram2[1]<<8)+(sram2[2]<<16)+(sram2[3]<<24);
@@ -181,11 +294,13 @@ void probe_sram_size()
 			//value has changed => 32k save is mirrored
 			if (newval2 != val2)
 			{
-				save_start = SAVE_START_32K;
+                save_start = SAVE_START_32K;
+				savetype = SRAM32K;
 			}
 			else
 			{
-				save_start = SAVE_START_64K;
+                save_start = SAVE_START_64K;
+				savetype = SRAM64K;
 			}
 			sram[0] = STATEID & 0xFF;
 		}
@@ -195,19 +310,22 @@ void probe_sram_size()
 			sram[0] ^= 0xFF;
 			if (sram2[0] == sram[0])
 			{
-				save_start = SAVE_START_32K;
+                save_start = SAVE_START_32K;
+				savetype = SRAM32K;
 			}
 			else
 			{
-				save_start = SAVE_START_64K;
+                save_start = SAVE_START_64K;
+				savetype = SRAM64K;
 			}
 			sram[0] ^= 0xFF;
 		}
 	}
 	else
 	{
-		//no match, it's 64K
-		save_start = SAVE_START_64K;
+        //no match, it's 64K
+        save_start = SAVE_START_64K;
+        savetype = SRAM64K;
 	}
 }
 
@@ -243,8 +361,8 @@ void getsram()	//copy GBA sram to sram_copy
 	
 	if(sramCopy32[0] != STATEID)	//if sram hasn't been copied already
 	{
-		probe_sram_size();  //stop NO$GBA from copying out-of-range data
-		bytecopy(sramCopy, sram, save_start);	//copy everything to sram_copy
+		probe_savetype();  //stop NO$GBA from copying out-of-range data
+        bytecopy(sramCopy, sram, save_start);	//copy everything to sram_copy
 		if(!(sramCopy32[0] == STATEID || sramCopy32[0] == STATEID2)) //valid gba save ram data?
 		{
 			sramCopy32[0] = STATEID;	//nope.  initialize
@@ -435,8 +553,18 @@ int updatestates(int index,int erase,int type)
 	terminator[1] = 0xFFFFFFFF;
 	
 	totalstatesize = newSaveEnd - sram_copy;
-	bytecopy(MEM_SRAM, sram_copy, totalstatesize + 8);
-	memset8(MEM_SRAM + totalstatesize + 8, 0, save_start - (totalstatesize + 8));
+    if (savetype == FLASH64K)
+    {
+        for (u8 *it = MEM_SRAM; it < &MEM_SRAM[save_start]; it += 0x1000)
+            flash_erase_sector(it);
+        flash_bytecopy_raw(MEM_SRAM, sram_copy, totalstatesize + 8);
+        flash_zerofill(MEM_SRAM + totalstatesize + 8, save_start - (totalstatesize + 8));
+    }
+    else
+    {
+        bytecopy(MEM_SRAM, sram_copy, totalstatesize + 8);
+        memset8(MEM_SRAM + totalstatesize + 8, 0, save_start - (totalstatesize + 8));
+    }
 	return 1;
 	/*
 	
@@ -1089,7 +1217,14 @@ restart:
 	if (called_from==1 && chk==sram_owner)
 	{
 		//copy XGB_SRAM to MEM_SRAM, because some instructions (push) don't properly modify GBA SRAM
-		bytecopy(MEM_SRAM+save_start,XGB_SRAM,0x2000);
+        if (savetype == FLASH64K)
+        {
+            flash_bytecopy(MEM_SRAM+save_start,XGB_SRAM,0x2000);
+        }
+        else
+        {
+            bytecopy(MEM_SRAM+save_start,XGB_SRAM,0x2000);
+        }
 	}
 	
 	if(i>=0 && cfg->sram_checksum)	//SRAM is occupied?
@@ -1273,7 +1408,14 @@ int get_saved_sram(void)
 		else
 		{
 			//otherwise, use the sram saving system
-			bytecopy(MEM_SRAM+save_start,XGB_SRAM,0x2000);
+            if (savetype == FLASH64K)
+            {
+                flash_bytecopy(MEM_SRAM+save_start,XGB_SRAM,0x2000);
+            }
+            else
+            {
+                bytecopy(MEM_SRAM+save_start,XGB_SRAM,0x2000);
+            }
 			register_sram_owner();//register new sram owner
 		}
 		return retval;
@@ -1313,7 +1455,14 @@ void setup_sram_after_loadstate() {
 		if (g_sramsize < 3)
 		{
 			//For 8KB size or less:
-			bytecopy(MEM_SRAM+save_start,XGB_SRAM,0x2000);		//copy gb sram to real sram
+			if (savetype == FLASH64K)
+            {
+                flash_bytecopy(MEM_SRAM+save_start,XGB_SRAM,0x2000);
+            }
+            else
+            {
+                bytecopy(MEM_SRAM+save_start,XGB_SRAM,0x2000);
+            }
 		}
 		else
 		{
@@ -1434,8 +1583,15 @@ void writeconfig()
 	if(i<0) {	//create new config
 		updatestates(0,0,CONFIGSAVE);
 	} else {		//config already exists, update sram directly (faster)
-		bytecopy((u8*)cfg-sram_copy+MEM_SRAM,(u8*)cfg,sizeof(configdata));
-	}
+       if (savetype == FLASH64K)
+        {
+            flash_bytecopy((u8*)cfg-sram_copy+MEM_SRAM,(u8*)cfg,sizeof(configdata));
+        }
+        else
+        {
+            bytecopy((u8*)cfg-sram_copy+MEM_SRAM,(u8*)cfg,sizeof(configdata));
+        }
+    }
 	
 	compressed_save = NULL;
 	current_save_file = NULL;
